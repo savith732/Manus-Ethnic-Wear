@@ -22,6 +22,24 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const DB_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DB_DIR, 'store.sqlite');
 
+const STOCK_IMAGES = {
+  'Royal Blue Kurta Set': 'https://images.unsplash.com/photo-1770359993283-a2c2f386584e?auto=format&fit=crop&w=900&q=82',
+  'Emerald Anarkali': 'https://images.unsplash.com/photo-1756483551860-2b312666ac53?auto=format&fit=crop&w=900&q=82',
+  'Maroon Silk Saree': 'https://images.unsplash.com/photo-1769500810141-644865a6d35c?auto=format&fit=crop&w=900&q=82',
+  'Ivory Nehru Jacket Set': 'https://images.unsplash.com/photo-1774437562554-d192d0087705?auto=format&fit=crop&w=900&q=82',
+  'Rose Festive Lehenga': 'https://images.unsplash.com/photo-1733937140732-2cc70a1d7017?auto=format&fit=crop&w=900&q=82',
+  'Kids Festive Kurta': 'https://images.unsplash.com/photo-1774438023077-d383f623b81c?auto=format&fit=crop&w=900&q=82'
+};
+
+const DEFAULT_STOCK = {
+  'Royal Blue Kurta Set': [['S',8],['M',12],['L',10],['XL',7],['XXL',4]],
+  'Emerald Anarkali': [['XS',5],['S',9],['M',12],['L',8],['XL',5]],
+  'Maroon Silk Saree': [['FREE SIZE',15]],
+  'Ivory Nehru Jacket Set': [['S',7],['M',10],['L',9],['XL',6],['XXL',3]],
+  'Rose Festive Lehenga': [['XS',4],['S',7],['M',10],['L',7],['XL',4]],
+  'Kids Festive Kurta': [['4Y',6],['6Y',8],['8Y',10],['10Y',7],['12Y',5]]
+};
+
 let sqliteDb = null;
 let pgPool = null;
 let usingPostgres = false;
@@ -55,17 +73,63 @@ async function dbQuery(sql, params = []) {
 }
 
 async function dbExec(sql) {
-  if (usingPostgres) {
-    await pgPool.query(sql);
-  } else {
-    sqliteDb.run(sql);
-  }
+  if (usingPostgres) await pgPool.query(sql);
+  else sqliteDb.run(sql);
 }
 
 function persistSqlite() {
   if (!usingPostgres && sqliteDb) {
     fs.mkdirSync(DB_DIR, { recursive: true });
     fs.writeFileSync(DB_FILE, Buffer.from(sqliteDb.export()));
+  }
+}
+
+async function withTransaction(work) {
+  if (usingPostgres) {
+    const client = await pgPool.connect();
+    try {
+      await client.query('BEGIN');
+      const query = async (sql, params = []) => (await client.query(sql, params)).rows;
+      await work(query);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+    return;
+  }
+
+  sqliteDb.run('BEGIN');
+  try {
+    const query = async (sql, params = []) => {
+      const stmt = sqliteDb.prepare(sqlitePlaceholders(sql));
+      if (params.length) stmt.bind(params);
+      const upper = sql.trim().toUpperCase();
+      if (upper.startsWith('SELECT') || upper.includes(' RETURNING ')) return sqliteRows(stmt);
+      stmt.step();
+      stmt.free();
+      return [];
+    };
+    await work(query);
+    sqliteDb.run('COMMIT');
+    persistSqlite();
+  } catch (err) {
+    sqliteDb.run('ROLLBACK');
+    throw err;
+  }
+}
+
+async function addOrderSizeColumn() {
+  try {
+    if (usingPostgres) {
+      await dbExec('ALTER TABLE order_items ADD COLUMN IF NOT EXISTS size TEXT');
+    } else {
+      await dbExec('ALTER TABLE order_items ADD COLUMN size TEXT');
+    }
+  } catch (err) {
+    if (!String(err.message || '').toLowerCase().includes('duplicate')) throw err;
   }
 }
 
@@ -116,6 +180,14 @@ async function initPostgres() {
       qty INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS product_variants (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      size TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+      UNIQUE(product_id, size)
+    );
+
     CREATE TABLE IF NOT EXISTS enquiries (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -124,6 +196,8 @@ async function initPostgres() {
       created_at TEXT NOT NULL
     );
   `);
+
+  await addOrderSizeColumn();
 }
 
 async function initSqlite() {
@@ -176,6 +250,14 @@ async function initSqlite() {
       qty INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS product_variants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL,
+      size TEXT NOT NULL,
+      quantity INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(product_id, size)
+    );
+
     CREATE TABLE IF NOT EXISTS enquiries (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -184,6 +266,43 @@ async function initSqlite() {
       created_at TEXT NOT NULL
     );
   `);
+
+  await addOrderSizeColumn();
+}
+
+async function setVariant(productId, size, quantity) {
+  const cleanSize = String(size || '').trim().toUpperCase();
+  const qty = Math.max(0, Math.floor(Number(quantity) || 0));
+  if (!cleanSize) return;
+
+  if (usingPostgres) {
+    await dbQuery(
+      `INSERT INTO product_variants (product_id, size, quantity)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (product_id, size)
+       DO UPDATE SET quantity = EXCLUDED.quantity`,
+      [productId, cleanSize, qty]
+    );
+  } else {
+    await dbQuery(
+      `INSERT INTO product_variants (product_id, size, quantity)
+       VALUES ($1, $2, $3)
+       ON CONFLICT(product_id, size)
+       DO UPDATE SET quantity = excluded.quantity`,
+      [productId, cleanSize, qty]
+    );
+  }
+}
+
+async function attachVariants(products) {
+  for (const product of products) {
+    product.variants = await dbQuery(
+      'SELECT size, quantity FROM product_variants WHERE product_id = $1 ORDER BY id',
+      [product.id]
+    );
+    product.total_stock = product.variants.reduce((sum, v) => sum + Number(v.quantity || 0), 0);
+  }
+  return products;
 }
 
 async function seedAndSyncAdmin() {
@@ -204,16 +323,14 @@ async function seedAndSyncAdmin() {
   }
 
   const countRows = await dbQuery('SELECT COUNT(*) AS count FROM products');
-  const count = Number(countRows[0]?.count || 0);
-
-  if (count === 0) {
+  if (Number(countRows[0]?.count || 0) === 0) {
     const products = [
-      ['Royal Blue Kurta Set', 79.99, 'Men', 'blue-kurta.svg', 'Classic festive kurta set'],
-      ['Emerald Anarkali', 99.99, 'Women', 'emerald-anarkali.svg', 'Elegant flowing Anarkali'],
-      ['Maroon Silk Saree', 119.99, 'Women', 'maroon-saree.svg', 'Rich silk saree for special occasions'],
-      ['Ivory Nehru Jacket Set', 89.99, 'Men', 'ivory-jacket.svg', 'Modern ivory Nehru jacket set'],
-      ['Rose Festive Lehenga', 139.99, 'Women', 'rose-lehenga.svg', 'Statement festive lehenga'],
-      ['Kids Festive Kurta', 49.99, 'Kids', 'kids-kurta.svg', 'Comfortable kids festive kurta']
+      ['Royal Blue Kurta Set',79.99,'Men','blue-kurta.svg','Classic festive kurta set'],
+      ['Emerald Anarkali',99.99,'Women','emerald-anarkali.svg','Elegant flowing Anarkali'],
+      ['Maroon Silk Saree',119.99,'Women','maroon-saree.svg','Rich silk saree for special occasions'],
+      ['Ivory Nehru Jacket Set',89.99,'Men','ivory-jacket.svg','Modern ivory Nehru jacket set'],
+      ['Rose Festive Lehenga',139.99,'Women','rose-lehenga.svg','Statement festive lehenga'],
+      ['Kids Festive Kurta',49.99,'Kids','kids-kurta.svg','Comfortable kids festive kurta']
     ];
 
     for (const p of products) {
@@ -224,18 +341,32 @@ async function seedAndSyncAdmin() {
     }
   }
 
+  const products = await dbQuery('SELECT id, name, image FROM products ORDER BY id');
+
+  for (const product of products) {
+    const stockImage = STOCK_IMAGES[product.name];
+    if (stockImage && !String(product.image || '').startsWith('http')) {
+      await dbQuery('UPDATE products SET image = $1 WHERE id = $2', [stockImage, product.id]);
+    }
+
+    const existing = await dbQuery(
+      'SELECT COUNT(*) AS count FROM product_variants WHERE product_id = $1',
+      [product.id]
+    );
+
+    if (Number(existing[0]?.count || 0) === 0) {
+      const defaults = DEFAULT_STOCK[product.name] || [['ONE SIZE', 10]];
+      for (const [size, qty] of defaults) await setVariant(product.id, size, qty);
+    }
+  }
+
   persistSqlite();
 }
 
 async function initDb() {
   if (DATABASE_URL) {
-    try {
-      await initPostgres();
-      console.log('Connected to PostgreSQL');
-    } catch (err) {
-      console.error('PostgreSQL connection failed:', err.message);
-      throw err;
-    }
+    await initPostgres();
+    console.log('Connected to PostgreSQL');
   } else {
     await initSqlite();
     console.log('Using local SQLite fallback');
@@ -269,7 +400,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     message: "Manu's Ethnic Wear backend is running",
-    database: usingPostgres ? 'PostgreSQL' : 'SQLite'
+    database: usingPostgres ? 'PostgreSQL' : 'SQLite',
+    inventory: 'size-and-quantity'
   });
 });
 
@@ -278,7 +410,7 @@ app.get('/api/products', async (req, res) => {
     const products = await dbQuery(
       'SELECT id, name, price, category, image, description FROM products WHERE active = 1 ORDER BY id DESC'
     );
-    res.json(products);
+    res.json(await attachVariants(products));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load products.' });
@@ -297,33 +429,44 @@ app.post('/api/orders', async (req, res) => {
       return res.status(400).json({ error: 'At least one product is required.' });
     }
 
-    let total = 0;
-    const verified = [];
-
-    for (const item of items) {
-      const products = await dbQuery(
-        'SELECT id, name, price FROM products WHERE id = $1 AND active = 1',
-        [Number(item.id)]
-      );
-
-      const product = products[0];
-      const qty = Math.max(1, parseInt(item.qty, 10) || 1);
-
-      if (!product) {
-        return res.status(400).json({ error: 'One of the selected products is unavailable.' });
-      }
-
-      verified.push({ ...product, qty });
-      total += Number(product.price) * qty;
-    }
-
     const orderId = 'MEW-' + crypto.randomBytes(4).toString('hex').toUpperCase();
     const now = new Date().toISOString();
+    let total = 0;
 
-    await dbExec('BEGIN');
+    await withTransaction(async query => {
+      const verified = [];
 
-    try {
-      await dbQuery(
+      for (const item of items) {
+        const products = await query(
+          'SELECT id, name, price FROM products WHERE id = $1 AND active = 1',
+          [Number(item.id)]
+        );
+        const product = products[0];
+        const size = String(item.size || '').trim().toUpperCase();
+        const qty = Math.max(1, parseInt(item.qty, 10) || 1);
+
+        if (!product || !size) throw new Error('INVALID_PRODUCT');
+
+        const stockSql = usingPostgres
+          ? 'SELECT quantity FROM product_variants WHERE product_id = $1 AND size = $2 FOR UPDATE'
+          : 'SELECT quantity FROM product_variants WHERE product_id = $1 AND size = $2';
+
+        const stocks = await query(stockSql, [Number(item.id), size]);
+        const available = Number(stocks[0]?.quantity || 0);
+
+        if (available < qty) {
+          const err = new Error('OUT_OF_STOCK');
+          err.productName = product.name;
+          err.size = size;
+          err.available = available;
+          throw err;
+        }
+
+        verified.push({ ...product, size, qty });
+        total += Number(product.price) * qty;
+      }
+
+      await query(
         'INSERT INTO orders (id, customer_name, phone, address, total, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
         [
           orderId,
@@ -337,24 +480,31 @@ app.post('/api/orders', async (req, res) => {
       );
 
       for (const item of verified) {
-        await dbQuery(
-          'INSERT INTO order_items (order_id, product_id, product_name, price, qty) VALUES ($1, $2, $3, $4, $5)',
-          [orderId, item.id, item.name, item.price, item.qty]
+        await query(
+          'INSERT INTO order_items (order_id, product_id, product_name, price, qty, size) VALUES ($1, $2, $3, $4, $5, $6)',
+          [orderId, item.id, item.name, item.price, item.qty, item.size]
+        );
+
+        await query(
+          'UPDATE product_variants SET quantity = quantity - $1 WHERE product_id = $2 AND size = $3',
+          [item.qty, item.id, item.size]
         );
       }
-
-      await dbExec('COMMIT');
-      persistSqlite();
-    } catch (err) {
-      await dbExec('ROLLBACK');
-      throw err;
-    }
+    });
 
     res.status(201).json({
       success: true,
       order: { id: orderId, total: Number(total.toFixed(2)) }
     });
   } catch (err) {
+    if (err.message === 'OUT_OF_STOCK') {
+      return res.status(409).json({
+        error: `${err.productName} size ${err.size} only has ${err.available} left.`
+      });
+    }
+    if (err.message === 'INVALID_PRODUCT') {
+      return res.status(400).json({ error: 'Choose an available size for every product.' });
+    }
     console.error(err);
     res.status(500).json({ error: 'Could not save order.' });
   }
@@ -393,7 +543,6 @@ app.post('/api/admin/login', async (req, res) => {
       'SELECT id, email, password_hash FROM admins WHERE email = $1',
       [String(email || '').trim().toLowerCase()]
     );
-
     const admin = admins[0];
 
     if (!admin || !(await bcrypt.compare(String(password || ''), admin.password_hash))) {
@@ -447,14 +596,12 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
 app.get('/api/admin/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await dbQuery('SELECT * FROM orders ORDER BY created_at DESC');
-
     for (const order of orders) {
       order.items = await dbQuery(
-        'SELECT product_name, price, qty FROM order_items WHERE order_id = $1',
+        'SELECT product_name, price, qty, size FROM order_items WHERE order_id = $1',
         [order.id]
       );
     }
-
     res.json(orders);
   } catch (err) {
     console.error(err);
@@ -465,7 +612,6 @@ app.get('/api/admin/orders', requireAdmin, async (req, res) => {
 app.patch('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
   try {
     const allowed = ['new', 'confirmed', 'packed', 'shipped', 'completed', 'cancelled'];
-
     if (!allowed.includes(req.body.status)) {
       return res.status(400).json({ error: 'Invalid status.' });
     }
@@ -485,7 +631,8 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
 
 app.get('/api/admin/products', requireAdmin, async (req, res) => {
   try {
-    res.json(await dbQuery('SELECT * FROM products ORDER BY id DESC'));
+    const products = await dbQuery('SELECT * FROM products ORDER BY id DESC');
+    res.json(await attachVariants(products));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not load products.' });
@@ -494,29 +641,71 @@ app.get('/api/admin/products', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/products', requireAdmin, async (req, res) => {
   try {
-    const { name, price, category, image, description } = req.body;
+    const { name, price, category, image, description, variants } = req.body;
 
     if (!name || !price || !category || !image) {
       return res.status(400).json({ error: 'Name, price, category and image are required.' });
     }
 
-    await dbQuery(
-      'INSERT INTO products (name, price, category, image, description, active, created_at) VALUES ($1, $2, $3, $4, $5, 1, $6)',
-      [
-        String(name).trim(),
-        Number(price),
-        String(category).trim(),
-        String(image).trim(),
-        String(description || '').trim(),
-        new Date().toISOString()
-      ]
-    );
+    let productId;
+
+    if (usingPostgres) {
+      const created = await dbQuery(
+        'INSERT INTO products (name, price, category, image, description, active, created_at) VALUES ($1, $2, $3, $4, $5, 1, $6) RETURNING id',
+        [
+          String(name).trim(),
+          Number(price),
+          String(category).trim(),
+          String(image).trim(),
+          String(description || '').trim(),
+          new Date().toISOString()
+        ]
+      );
+      productId = created[0].id;
+    } else {
+      await dbQuery(
+        'INSERT INTO products (name, price, category, image, description, active, created_at) VALUES ($1, $2, $3, $4, $5, 1, $6)',
+        [
+          String(name).trim(),
+          Number(price),
+          String(category).trim(),
+          String(image).trim(),
+          String(description || '').trim(),
+          new Date().toISOString()
+        ]
+      );
+      productId = Number((await dbQuery('SELECT last_insert_rowid() AS id'))[0].id);
+    }
+
+    const cleanVariants = Array.isArray(variants) ? variants : [];
+    for (const variant of cleanVariants) {
+      await setVariant(productId, variant.size, variant.quantity);
+    }
+    if (cleanVariants.length === 0) await setVariant(productId, 'ONE SIZE', 10);
 
     persistSqlite();
-    res.status(201).json({ success: true });
+    res.status(201).json({ success: true, id: productId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not add product.' });
+  }
+});
+
+app.patch('/api/admin/products/:id/stock', requireAdmin, async (req, res) => {
+  try {
+    const productId = Number(req.params.id);
+    const variants = Array.isArray(req.body.variants) ? req.body.variants : [];
+    if (!variants.length) return res.status(400).json({ error: 'Add at least one size.' });
+
+    for (const variant of variants) {
+      await setVariant(productId, variant.size, variant.quantity);
+    }
+
+    persistSqlite();
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update stock.' });
   }
 });
 
@@ -552,7 +741,6 @@ app.use((req, res) => {
   if (req.path.startsWith('/api/')) {
     return res.status(404).json({ error: 'API route not found.' });
   }
-
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
@@ -561,6 +749,7 @@ initDb()
     app.listen(PORT, () => {
       console.log(`Store running on port ${PORT}`);
       console.log(`Database: ${usingPostgres ? 'PostgreSQL' : 'SQLite'}`);
+      console.log('Inventory: sizes + quantity enabled');
     });
   })
   .catch(err => {
