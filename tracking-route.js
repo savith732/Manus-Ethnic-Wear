@@ -23,6 +23,18 @@ module.exports = function registerTracking(app, dbQuery) {
         [order.id]
       );
 
+      order.events = await dbQuery(
+        'SELECT status, created_at FROM order_events WHERE order_id = $1 ORDER BY id',
+        [order.id]
+      );
+
+      if (!order.events.length) {
+        order.events = [{ status: 'new', created_at: order.created_at }];
+        if (order.status !== 'new') {
+          order.events.push({ status: order.status, created_at: null });
+        }
+      }
+
       res.json({ order });
     } catch (err) {
       console.error(err);
