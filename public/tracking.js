@@ -11,7 +11,12 @@ function renderTracking(order){
   }
 
   const current=Math.max(0,trackSteps.indexOf(order.status));
-  const steps=trackSteps.map((step,i)=>`<div class="track-step ${i<=current?'done':''} ${i===current?'current':''}"><span class="dot">${i<current?'✓':i+1}</span><span>${trackLabels[step]}</span></div>`).join('');
+  const eventMap=new Map((order.events||[]).map(e=>[e.status,e.created_at]));
+  const steps=trackSteps.map((step,i)=>{
+    const ts=eventMap.get(step);
+    const timeText=ts?new Date(ts).toLocaleString():(i<=current?'Updated':'');
+    return `<div class="track-step ${i<=current?'done':''} ${i===current?'current':''}"><span class="dot">${i<current?'✓':i+1}</span><span><strong>${trackLabels[step]}</strong>${timeText?`<small>${timeText}</small>`:''}</span></div>`;
+  }).join('');
   const items=(order.items||[]).map(i=>`<li><span>${i.product_name} <small>Size ${i.size||'—'} × ${i.qty}</small></span><strong>${trackMoney(Number(i.price)*Number(i.qty))}</strong></li>`).join('');
 
   trackResult.innerHTML=`<div class="track-card">
