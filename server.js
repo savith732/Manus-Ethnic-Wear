@@ -733,6 +733,8 @@ app.get('/api/admin/enquiries', requireAdmin, async (req, res) => {
   }
 });
 
+require('./tracking-route')(app, dbQuery);
+
 app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin', 'index.html'));
 });
