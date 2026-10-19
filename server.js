@@ -133,6 +133,28 @@ async function addOrderSizeColumn() {
   }
 }
 
+async function ensureOrderEventsTable() {
+  if (usingPostgres) {
+    await dbExec(`
+      CREATE TABLE IF NOT EXISTS order_events (
+        id SERIAL PRIMARY KEY,
+        order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+  } else {
+    await dbExec(`
+      CREATE TABLE IF NOT EXISTS order_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+  }
+}
+
 async function initPostgres() {
   pgPool = new Pool({
     connectionString: DATABASE_URL,
@@ -198,6 +220,7 @@ async function initPostgres() {
   `);
 
   await addOrderSizeColumn();
+  await ensureOrderEventsTable();
 }
 
 async function initSqlite() {
@@ -268,6 +291,7 @@ async function initSqlite() {
   `);
 
   await addOrderSizeColumn();
+  await ensureOrderEventsTable();
 }
 
 async function setVariant(productId, size, quantity) {
@@ -616,10 +640,26 @@ app.patch('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Invalid status.' });
     }
 
-    await dbQuery(
-      'UPDATE orders SET status = $1 WHERE id = $2',
-      [req.body.status, req.params.id]
+    const current = await dbQuery(
+      'SELECT status FROM orders WHERE id = $1',
+      [req.params.id]
     );
+
+    if (!current[0]) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    if (current[0].status !== req.body.status) {
+      await dbQuery(
+        'UPDATE orders SET status = $1 WHERE id = $2',
+        [req.body.status, req.params.id]
+      );
+
+      await dbQuery(
+        'INSERT INTO order_events (order_id, status, created_at) VALUES ($1, $2, $3)',
+        [req.params.id, req.body.status, new Date().toISOString()]
+      );
+    }
 
     persistSqlite();
     res.json({ success: true });
